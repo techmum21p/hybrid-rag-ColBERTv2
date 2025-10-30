@@ -1,0 +1,19 @@
+# Core RAG dependencies
+bm25s[full]>=0.1.0
+PyStemmer>=2.2.0.1
+ragatouille>=0.0.8
+transformers>=4.30.0
+torch>=2.0.0
+
+# Document processing - UPDATED
+pymupdf4llm>=0.0.9
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+
+# Utilities
+numpy>=1.24.0
+requests>=2.31.0
+
+# Optional: Better performance on Mac M4
+# Uncomment if you want Metal acceleration
+# tensorflow-metal>=1.0.0
