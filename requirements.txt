@@ -1,0 +1,21 @@
+# Core RAG Dependencies
+pymupdf4llm>=0.0.4
+PyMuPDF>=1.23.0
+bm25s[full]>=0.1.0
+PyStemmer>=2.2.0.1
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+torch>=2.0.0
+
+# Database
+SQLAlchemy>=2.0.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# HTTP Client (for Ollama)
+requests>=2.31.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
