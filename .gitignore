@@ -3,8 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-# C extensions
-*.so
+# Extracted images and databases
+/notebooks/extracted_images
+/notebooks/rag_local.db
 
 # Distribution / packaging
 .Python
