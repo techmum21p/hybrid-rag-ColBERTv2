@@ -16,19 +16,25 @@ Requirements:
 """
 
 import os
+# Suppress tokenizers parallelism warning when forking
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 import re
 import io
 import time
+import warnings
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+# Suppress deprecation warnings from transformers/sentence-transformers
+warnings.filterwarnings('ignore', message='.*torch_dtype.*deprecated.*')
+
 # Core libraries
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image as PILImage  # Renamed to avoid conflict with database model
 
 # PDF and text processing
 import pymupdf4llm
@@ -37,6 +43,7 @@ from transformers import AutoTokenizer
 
 # Retrieval
 import bm25s
+from Stemmer import Stemmer
 from sentence_transformers import SentenceTransformer
 
 # Database
@@ -56,13 +63,18 @@ import requests  # For Ollama API
 @dataclass
 class RAGConfig:
     """Configuration for local RAG system"""
-    # Database
-    db_path: str = "rag_local.db"
+    # Base directory (set to project root)
+    base_dir: str = os.path.abspath(os.path.dirname(__file__))
     
-    # Chunking
-    min_chunk_size: int = 256
-    max_chunk_size: int = 1024
-    chunk_overlap: int = 128
+    # Database
+    db_path: str = None
+    
+    # Chunking - OPTIMIZED for user manuals with charts/images
+    # Using larger chunks to preserve visual-text relationships
+    # This effectively implements "late chunking" with ColBERT
+    min_chunk_size: int = 512  # Increased to keep more context together
+    max_chunk_size: int = 1500  # Much larger to keep full sections intact
+    chunk_overlap: int = 200  # More overlap to maintain continuity
     
     # Retrieval
     bm25_top_k: int = 100
@@ -76,14 +88,26 @@ class RAGConfig:
     
     # Ollama
     ollama_url: str = "http://localhost:11434"
+    ollama_timeout: int = 300  # Increased timeout for slower models
     
-    # Paths
-    bm25_index_path: str = "indexes/bm25s"
-    colbert_index_path: str = "indexes/colbert"
-    images_dir: str = "extracted_images"
+    # Paths (will be set to absolute paths in __post_init__)
+    bm25_index_path: str = None
+    colbert_index_path: str = None
+    images_dir: str = None
     
     # Device
     device: str = "mps" if torch.backends.mps.is_available() else "cpu"
+    
+    def __post_init__(self):
+        """Set absolute paths after initialization"""
+        if self.db_path is None:
+            self.db_path = os.path.join(self.base_dir, "rag_local.db")
+        if self.bm25_index_path is None:
+            self.bm25_index_path = os.path.join(self.base_dir, "indexes", "bm25s")
+        if self.colbert_index_path is None:
+            self.colbert_index_path = os.path.join(self.base_dir, "indexes", "colbert")
+        if self.images_dir is None:
+            self.images_dir = os.path.join(self.base_dir, "extracted_images")
 
 
 # ============================================================================
@@ -140,8 +164,9 @@ class OllamaClient:
         self, 
         model: str, 
         prompt: str, 
-        system: str = None,
-        images: List[str] = None
+        system: str = "",
+        images: List[str] = None,
+        timeout: int = 300
     ) -> str:
         """Generate text with Ollama"""
         url = f"{self.base_url}/api/generate"
@@ -159,54 +184,87 @@ class OllamaClient:
             payload["images"] = images
         
         try:
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
             return response.json()["response"]
+        except requests.exceptions.Timeout:
+            print(f" Ollama timeout after {timeout}s - model may be too slow or stuck")
+            return ""
         except Exception as e:
-            print(f"❌ Ollama error: {e}")
+            print(f" Ollama error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response content: {e.response.text}")
             return ""
     
     def analyze_image(self, image_path: str) -> Dict[str, str]:
-        """Analyze image using LLaVA vision model"""
-        
+        """Analyze image using Gemma3 multimodal model"""
+        if not os.path.exists(image_path):
+            print(f" Image not found: {image_path}")
+            return {
+                'description': 'Image not found',
+                'type': 'error',
+                'ocr_text': ''
+            }
+            
         # Read image and convert to base64
-        with open(image_path, "rb") as f:
-            import base64
-            image_data = base64.b64encode(f.read()).decode('utf-8')
-        
-        # Generate description
-        description_prompt = """Analyze this image and provide:
+        try:
+            with open(image_path, "rb") as f:
+                import base64
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+                
+            # Generate description using Gemma3
+            description_prompt = """[IMAGE] Analyze this image and provide:
 1. TYPE: What type of visual is this? (diagram, chart, table, screenshot, photo, etc.)
 2. DESCRIPTION: A detailed description of what the image shows (2-3 sentences)
 3. TEXT: Any visible text in the image (transcribe exactly)
 
-Format your response as:
+Format your response exactly as follows, including the section headers:
 TYPE: [type]
 DESCRIPTION: [description]
 TEXT: [extracted text]"""
-        
-        response = self.generate(
-            model=self.config.vision_model,
-            prompt=description_prompt,
-            images=[image_data]
-        )
-        
-        # Parse response
-        result = {
-            'description': '',
-            'type': 'unknown',
-            'ocr_text': ''
-        }
-        
-        for line in response.split('\n'):
-            if line.startswith('TYPE:'):
-                result['type'] = line.replace('TYPE:', '').strip().lower()
-            elif line.startswith('DESCRIPTION:'):
-                result['description'] = line.replace('DESCRIPTION:', '').strip()
-            elif line.startswith('TEXT:'):
-                result['ocr_text'] = line.replace('TEXT:', '').strip()
-        
-        return result
+            
+            response = self.generate(
+                model="gemma3:4b",  # Using Gemma3 for image analysis
+                prompt=description_prompt,
+                images=[image_data],
+                timeout=120  # Increased timeout for image analysis
+            )
+            
+            # Parse response with more robust parsing
+            result = {
+                'description': 'No description generated',
+                'type': 'unknown',
+                'ocr_text': ''
+            }
+            
+            if response:
+                # Try to extract sections using regex
+                import re
+                
+                # Try to find TYPE
+                type_match = re.search(r'TYPE:\s*(.+)', response, re.IGNORECASE)
+                if type_match:
+                    result['type'] = type_match.group(1).strip().lower()
+                
+                # Try to find DESCRIPTION
+                desc_match = re.search(r'DESCRIPTION:([\s\S]*?)(?=TEXT:|$)', response, re.IGNORECASE)
+                if desc_match:
+                    result['description'] = desc_match.group(1).strip()
+                
+                # Try to find TEXT
+                text_match = re.search(r'TEXT:([\s\S]*)', response, re.IGNORECASE)
+                if text_match:
+                    result['ocr_text'] = text_match.group(1).strip()
+            
+            return result
+            
+        except Exception as e:
+            print(f" Error analyzing image {image_path}: {str(e)}")
+            return {
+                'description': f'Error analyzing image: {str(e)}',
+                'type': 'error',
+                'ocr_text': ''
+            }
     
     def chat(
         self, 
@@ -229,7 +287,8 @@ TEXT: [extracted text]"""
         return self.generate(
             model=self.config.chat_model,
             prompt=prompt,
-            system=system_msg
+            system=system_msg,
+            timeout=self.config.ollama_timeout
         )
 
 
@@ -491,32 +550,77 @@ class DocumentProcessor:
         document_id: int
     ) -> List[Dict]:
         """Extract images from PDF and save to disk"""
+        # Ensure images directory exists
+        os.makedirs(self.config.images_dir, exist_ok=True)
+        
         doc = fitz.open(pdf_path)
         images = []
         
         for page_num in range(len(doc)):
             page = doc[page_num]
-            image_list = page.get_images()
+            image_list = page.get_images(full=True)  # Get all images including inline images
             
-            for img_index, img in enumerate(image_list):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                
-                # Save image
-                image_filename = f"doc{document_id}_page{page_num+1}_img{img_index+1}.png"
-                image_path = os.path.join(self.config.images_dir, image_filename)
-                
-                with open(image_path, "wb") as img_file:
-                    img_file.write(image_bytes)
-                
-                images.append({
-                    'page_number': page_num + 1,
-                    'image_path': image_path,
-                    'image_index': img_index
-                })
+            for img_index, img_info in enumerate(image_list):
+                xref = img_info[0]
+                try:
+                    # Extract image with more detailed information
+                    base_image = doc.extract_image(xref)
+                    if base_image is None:
+                        print(f"    ⚠️  Could not extract image {img_index+1} on page {page_num+1}")
+                        continue
+                        
+                    image_bytes = base_image.get("image")
+                    if not image_bytes:
+                        print(f"    ⚠️  No image data found for image {img_index+1} on page {page_num+1}")
+                        continue
+                    
+                    # Get image format from the PDF or default to png
+                    ext = base_image.get("ext", "png").lower()
+                    if ext == 'jpx':
+                        ext = 'jpeg'  # Convert jpx to jpeg for better compatibility
+                    
+                    # Create a unique filename
+                    image_filename = f"doc{document_id}_page{page_num+1}_img{img_index+1}.{ext}"
+                    image_path = os.path.join(self.config.images_dir, image_filename)
+                    
+                    # Save the image directly from bytes to preserve quality
+                    with open(image_path, "wb") as img_file:
+                        img_file.write(image_bytes)
+                    
+                    # Verify the image was saved correctly
+                    try:
+                        # Try to open the image to verify it's valid
+                        with PILImage.open(image_path) as img:
+                            # If the image is in CMYK mode, convert to RGB
+                            if img.mode == 'CMYK':
+                                img = img.convert('RGB')
+                                img.save(image_path, 'PNG' if ext == 'png' else 'JPEG', quality=95)
+                            # If the image has transparency, ensure it's saved as PNG
+                            elif img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                                img = img.convert('RGBA')
+                                img.save(image_path, 'PNG')
+                    except Exception as e:
+                        print(f"    ⚠️  Error processing image {image_filename}: {e}")
+                        continue
+                    
+                    images.append({
+                        'page_number': page_num + 1,
+                        'image_path': os.path.abspath(image_path),  # Use absolute path
+                        'image_index': img_index
+                    })
+                    
+                    print(f"    ✅ Extracted image {len(images)} from page {page_num+1}")
+                    
+                except Exception as e:
+                    print(f"    ⚠️  Failed to process image {img_index+1} on page {page_num+1}: {str(e)}")
         
         doc.close()
+        
+        if not images:
+            print("    ℹ️  No images were extracted from the PDF.")
+        else:
+            print(f"    ✅ Extracted {len(images)} images total.")
+            
         return images
     
     def analyze_images(
@@ -693,7 +797,7 @@ class DocumentProcessor:
                 heading_path=chunk.get('heading_path', ''),
                 token_count=chunk.get('token_count', 0),
                 has_images=chunk.get('has_images', False),
-                metadata=json.dumps({
+                chunk_metadata=json.dumps({
                     k: v for k, v in chunk.items() 
                     if k not in ['text', 'heading_path', 'token_count', 'has_images']
                 })
@@ -754,6 +858,9 @@ class JinaColBERTRetriever:
     
     def search(self, query: str, k: int = 10) -> List[Dict]:
         """Search using MaxSim scoring"""
+        if not self.corpus or len(self.corpus) == 0:
+            return []
+        
         # Encode query
         query_embedding = self.model.encode(
             query,
@@ -763,8 +870,17 @@ class JinaColBERTRetriever:
         # Compute MaxSim scores
         scores = self._maxsim_score(query_embedding, self.corpus_embeddings)
         
+        # Handle single item corpus
+        if len(self.corpus) == 1:
+            return [{
+                'document_id': 0,
+                'score': float(scores.item() if scores.dim() == 0 else scores[0]),
+                'text': self.corpus[0]
+            }]
+        
         # Get top-k
-        top_k_indices = torch.topk(scores, k=min(k, len(scores))).indices
+        k = min(k, len(scores))
+        top_k_indices = torch.topk(scores, k=k).indices
         
         results = []
         for idx in top_k_indices:
@@ -778,12 +894,37 @@ class JinaColBERTRetriever:
     
     def rerank(self, query: str, documents: List[str], k: int = 10) -> List[Dict]:
         """Rerank documents with more accurate scoring"""
-        # Encode query and documents
-        query_embedding = self.model.encode(query, convert_to_tensor=True)
-        doc_embeddings = self.model.encode(documents, convert_to_tensor=True)
+        if not documents:
+            return []
+            
+        try:
+            # Encode query and documents
+            query_embedding = self.model.encode(query, convert_to_tensor=True)
+            doc_embeddings = self.model.encode(
+                documents, 
+                convert_to_tensor=True,
+                batch_size=8  # Smaller batch size for stability
+            )
+        except Exception as e:
+            print(f"Error during reranking: {str(e)}")
+            return [{
+                'result_index': i,
+                'score': 0.0,  # Fallback score
+                'rank': i + 1,
+                'text': doc
+            } for i, doc in enumerate(documents[:k])]
         
         # Compute MaxSim scores
         scores = self._maxsim_score(query_embedding, doc_embeddings)
+        
+        # Handle single document
+        if len(documents) == 1:
+            return [{
+                'result_index': 0,
+                'score': float(scores.item() if scores.dim() == 0 else scores[0]),
+                'rank': 1,
+                'text': documents[0]
+            }]
         
         # Sort by score
         sorted_indices = torch.argsort(scores, descending=True)
@@ -810,25 +951,49 @@ class JinaColBERTRetriever:
         MaxSim: For each query token, find max similarity with all doc tokens,
         then average across query tokens
         """
-        # Ensure 3D tensors [batch, seq_len, hidden_dim]
-        if query_embedding.dim() == 2:
+        # Ensure proper dimensions
+        if query_embedding.dim() == 1:
             query_embedding = query_embedding.unsqueeze(0)
-        if doc_embeddings.dim() == 2:
+        if doc_embeddings.dim() == 1:
             doc_embeddings = doc_embeddings.unsqueeze(0)
         
-        # Compute similarity: [batch_q, seq_q, batch_d, seq_d]
-        # Simplified: just use mean pooling for now (Jina's model handles this internally)
-        query_vec = query_embedding.mean(dim=1)  # [batch_q, hidden]
-        doc_vec = doc_embeddings.mean(dim=1)     # [batch_d, hidden]
+        # For 2D embeddings (single vector per doc), compute cosine similarity directly
+        if query_embedding.dim() == 2 and doc_embeddings.dim() == 2:
+            # Normalize embeddings
+            query_norm = torch.nn.functional.normalize(query_embedding, p=2, dim=1)
+            doc_norm = torch.nn.functional.normalize(doc_embeddings, p=2, dim=1)
+            
+            # Compute cosine similarity
+            scores = torch.mm(query_norm, doc_norm.t())
+            
+            # Return as 1D tensor
+            return scores.squeeze(0) if scores.size(0) == 1 else scores.squeeze()
         
-        # Cosine similarity
-        scores = torch.nn.functional.cosine_similarity(
-            query_vec.unsqueeze(1), 
-            doc_vec.unsqueeze(0),
-            dim=2
-        )
+        # For 3D embeddings (token-level), use mean pooling
+        if query_embedding.dim() == 3:
+            query_vec = query_embedding.mean(dim=1)
+        else:
+            query_vec = query_embedding
+            
+        if doc_embeddings.dim() == 3:
+            doc_vec = doc_embeddings.mean(dim=1)
+        else:
+            doc_vec = doc_embeddings
         
-        return scores.squeeze()
+        # Normalize
+        query_vec = torch.nn.functional.normalize(query_vec, p=2, dim=-1)
+        doc_vec = torch.nn.functional.normalize(doc_vec, p=2, dim=-1)
+        
+        # Compute cosine similarity
+        if query_vec.dim() == 1:
+            query_vec = query_vec.unsqueeze(0)
+        if doc_vec.dim() == 1:
+            doc_vec = doc_vec.unsqueeze(0)
+            
+        scores = torch.mm(query_vec, doc_vec.t())
+        
+        # Return as 1D tensor
+        return scores.squeeze(0) if scores.size(0) == 1 else scores.squeeze()
 
 
 # ============================================================================
@@ -898,36 +1063,46 @@ class HybridRetriever:
         
         print(f"\n🔍 Retrieving relevant chunks...")
         
+        # Get corpus size to adjust k values
+        corpus_size = len(self.indexer.colbert_retriever.corpus) if self.indexer.colbert_retriever.corpus else 0
+        
+        # Adjust k values based on corpus size
+        bm25_k = min(self.config.bm25_top_k, corpus_size) if corpus_size > 0 else self.config.bm25_top_k
+        colbert_k = min(self.config.colbert_top_k, corpus_size) if corpus_size > 0 else self.config.colbert_top_k
+        
+        print(f"   • Corpus size: {corpus_size}, using k={bm25_k} for retrieval")
+        
         # Stage 1: BM25s
         start = time.time()
-        bm25_results = self._bm25_search(query, k=self.config.bm25_top_k)
+        bm25_results = self._bm25_search(query, k=bm25_k)
         bm25_time = time.time() - start
-        print(f"   • BM25s: {bm25_time:.3f}s")
+        print(f"   • BM25s: {bm25_time:.3f}s ({len(bm25_results)} results)")
         
         # Stage 2: ColBERT
         start = time.time()
-        colbert_results = self._colbert_search(query, k=self.config.colbert_top_k)
+        colbert_results = self._colbert_search(query, k=colbert_k)
         colbert_time = time.time() - start
-        print(f"   • ColBERT: {colbert_time:.3f}s")
+        print(f"   • ColBERT: {colbert_time:.3f}s ({len(colbert_results)} results)")
         
         # Fusion
         start = time.time()
         fused_results = self._reciprocal_rank_fusion(bm25_results, colbert_results)
-        candidates = fused_results[:50]
+        candidates = fused_results[:min(50, len(fused_results))]
         fusion_time = time.time() - start
-        print(f"   • Fusion: {fusion_time:.3f}s")
+        print(f"   • Fusion: {fusion_time:.3f}s ({len(candidates)} candidates)")
         
         # Fetch chunks
         start = time.time()
         candidate_chunks = self._fetch_chunks_from_db([r['chunk_id'] for r in candidates])
         fetch_time = time.time() - start
-        print(f"   • Fetch: {fetch_time:.3f}s")
+        print(f"   • Fetch: {fetch_time:.3f}s ({len(candidate_chunks)} chunks)")
         
         # Stage 3: Rerank
         start = time.time()
-        reranked_results = self._colbert_rerank(query, candidate_chunks, top_k=top_k_final)
+        final_k = min(top_k_final, len(candidate_chunks))
+        reranked_results = self._colbert_rerank(query, candidate_chunks, top_k=final_k)
         rerank_time = time.time() - start
-        print(f"   • Rerank: {rerank_time:.3f}s")
+        print(f"   • Rerank: {rerank_time:.3f}s (top {len(reranked_results)})")
         
         total_time = bm25_time + colbert_time + fusion_time + fetch_time + rerank_time
         print(f"   ✓ Total retrieval: {total_time:.3f}s")
@@ -936,18 +1111,46 @@ class HybridRetriever:
     
     def _bm25_search(self, query: str, k: int) -> List[Dict]:
         """Stage 1: BM25s lexical search"""
-        query_tokens = bm25s.tokenize(
-            query, 
-            stopwords="en",
-            stemmer=bm25s.stemmer.Stemmer.Stemmer("english")
-        )
-        
-        results, scores = self.indexer.bm25_retriever.retrieve(query_tokens, k=k)
-        
-        return [
-            {'chunk_id': int(results[0][i]), 'score': float(scores[0][i]), 'source': 'bm25'}
-            for i in range(len(results[0]))
-        ]
+        try:
+            # Initialize stemmer and tokenize
+            english_stemmer = Stemmer("english")
+            
+            # Tokenize query
+            query_tokens = bm25s.tokenize(
+                [query],
+                stopwords="en",
+                stemmer=english_stemmer
+            )
+            
+            if self.indexer.bm25_retriever is None:
+                print("Warning: BM25 retriever not initialized")
+                return []
+            
+            # Perform search    
+            results, scores = self.indexer.bm25_retriever.retrieve(query_tokens, k=k)
+            
+            # Validate results
+            if not results or len(results) == 0 or len(results[0]) == 0:
+                print("Warning: BM25 search returned no results")
+                return []
+                
+            # Process results safely
+            try:
+                return [
+                    {
+                        'chunk_id': int(results[0][i]), 
+                        'score': float(scores[0][i]) if scores and len(scores) > 0 and i < len(scores[0]) else 0.0,
+                        'source': 'bm25'
+                    }
+                    for i in range(len(results[0]))
+                ]
+            except (IndexError, ValueError, TypeError) as e:
+                print(f"Error processing BM25 results: {str(e)}")
+                return []
+                
+        except Exception as e:
+            print(f"BM25 search error: {str(e)}")
+            return []
     
     def _colbert_search(self, query: str, k: int) -> List[Dict]:
         """Stage 2: ColBERT semantic search"""
@@ -963,19 +1166,44 @@ class HybridRetriever:
         colbert_results: List[Dict],
         k: int = 60
     ) -> List[Dict]:
-        """RRF fusion"""
+        """RRF fusion with score preservation"""
         scores = {}
+        original_scores = {}
         
+        # Process BM25 results
         for rank, result in enumerate(bm25_results, 1):
-            chunk_id = result['chunk_id']
-            scores[chunk_id] = scores.get(chunk_id, 0) + (1 / (k + rank))
+            chunk_id = result.get('chunk_id')
+            if chunk_id is not None:
+                rrf_score = 1 / (k + rank)
+                scores[chunk_id] = scores.get(chunk_id, 0) + rrf_score
+                original_scores[chunk_id] = {
+                    'bm25_score': result.get('score', 0.0),
+                    'rank': rank
+                }
         
+        # Process ColBERT results
         for rank, result in enumerate(colbert_results, 1):
-            chunk_id = result['chunk_id']
-            scores[chunk_id] = scores.get(chunk_id, 0) + (1 / (k + rank))
+            chunk_id = result.get('chunk_id')
+            if chunk_id is not None:
+                rrf_score = 1 / (k + rank)
+                scores[chunk_id] = scores.get(chunk_id, 0) + rrf_score
+                if chunk_id in original_scores:
+                    original_scores[chunk_id]['colbert_score'] = result.get('score', 0.0)
+                else:
+                    original_scores[chunk_id] = {
+                        'colbert_score': result.get('score', 0.0),
+                        'rank': rank
+                    }
         
+        # Sort and return results with all scores
         sorted_results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [{'chunk_id': cid, 'rrf_score': score} for cid, score in sorted_results]
+        return [{
+            'chunk_id': cid,
+            'rrf_score': score,
+            'bm25_score': original_scores[cid].get('bm25_score', 0.0),
+            'colbert_score': original_scores[cid].get('colbert_score', 0.0),
+            'rank': original_scores[cid].get('rank', 999)
+        } for cid, score in sorted_results]
     
     def _fetch_chunks_from_db(self, chunk_ids: List[int]) -> List[Dict]:
         """Fetch chunks from database"""
@@ -995,21 +1223,96 @@ class HybridRetriever:
     
     def _colbert_rerank(self, query: str, chunks: List[Dict], top_k: int) -> List[Dict]:
         """Stage 3: ColBERT reranking"""
-        documents = [chunk['text'] for chunk in chunks]
-        reranked_results = self.indexer.colbert_retriever.rerank(query=query, documents=documents, k=top_k)
-        
-        final_results = []
-        for result in reranked_results:
-            original_chunk = chunks[result['result_index']]
-            final_results.append({
-                'chunk_id': original_chunk['chunk_id'],
-                'text': original_chunk['text'],
-                'document_id': original_chunk['document_id'],
-                'heading_path': original_chunk.get('heading_path', ''),
-                'has_images': original_chunk.get('has_images', False),
-                'metadata': original_chunk['metadata'],
-                'score': result['score'],
-                'rank': result['rank']
+        if not chunks:
+            return []
+            
+        try:
+            # Safety check for text field
+            documents = []
+            valid_chunks = []
+            for chunk in chunks:
+                if chunk.get('text'):
+                    documents.append(chunk['text'])
+                    valid_chunks.append(chunk)
+                    
+            if not documents:
+                print("Warning: No valid documents for reranking")
+                return chunks[:top_k]  # Return original chunks if no valid documents
+                
+            # Attempt reranking
+            reranked_results = self.indexer.colbert_retriever.rerank(
+                query=query, 
+                documents=documents, 
+                k=min(top_k, len(documents))
+            )
+            
+            # Safety check for reranking results
+            if not reranked_results:
+                print("Warning: Reranking returned no results")
+                return chunks[:top_k]
+                
+            final_results = []
+            for result in reranked_results:
+                try:
+                    original_chunk = valid_chunks[result.get('result_index', 0)]
+                    final_results.append({
+                        'chunk_id': original_chunk.get('chunk_id'),
+                        'text': original_chunk.get('text', ''),
+                        'document_id': original_chunk.get('document_id'),
+                        'heading_path': original_chunk.get('heading_path', ''),
+                        'has_images': original_chunk.get('has_images', False),
+                        'metadata': original_chunk.get('metadata', {}),
+                        'score': float(result.get('score', 0.0)),  # Ensure float conversion
+                        'rank': int(result.get('rank', 1))  # Ensure int conversion
+                    })
+                except (KeyError, IndexError, ValueError) as e:
+                    print(f"Error processing reranked result: {str(e)}")
+                    continue
+                    
+            if final_results:
+                return final_results
+            
+            # Fallback if something went wrong with reranking
+            return [{
+                'chunk_id': chunk.get('chunk_id'),
+                'text': chunk.get('text', ''),
+                'document_id': chunk.get('document_id'),
+                'heading_path': chunk.get('heading_path', ''),
+                'has_images': chunk.get('has_images', False),
+                'metadata': chunk.get('metadata', {}),
+                'score': 0.0,
+                'rank': i + 1
+            } for i, chunk in enumerate(chunks[:top_k])]
+            
+        except Exception as e:
+            print(f"Error during reranking: {str(e)}")
+            # Return original chunks with default scores on error
+            return [{
+                'chunk_id': chunk.get('chunk_id'),
+                'text': chunk.get('text', ''),
+                'document_id': chunk.get('document_id'),
+                'heading_path': chunk.get('heading_path', ''),
+                'has_images': chunk.get('has_images', False),
+                'metadata': chunk.get('metadata', {}),
+                'score': 0.0,
+                'rank': i + 1
+            } for i, chunk in enumerate(chunks[:top_k])]
+                })
+            return final_results
+            
+        except Exception as e:
+            print(f"Error during reranking: {str(e)}")
+            # Fallback: return chunks with default scoring
+            return [{
+                'chunk_id': chunk['chunk_id'],
+                'text': chunk['text'],
+                'document_id': chunk['document_id'],
+                'heading_path': chunk.get('heading_path', ''),
+                'has_images': chunk.get('has_images', False),
+                'metadata': chunk['metadata'],
+                'score': 0.0,  # Default score
+                'rank': i + 1
+            } for i, chunk in enumerate(chunks[:top_k])]
             })
         return final_results
 
@@ -1236,6 +1539,15 @@ class RAGApplication:
         print(f"   • Documents: {doc_count}")
         print(f"   • Chunks: {chunk_count}")
         print(f"   • Images: {image_count}")
+        print(f"   • Database path: {self.config.db_path}")
+        print(f"   • Images directory: {self.config.images_dir}")
+        
+        # Show sample data if available
+        if doc_count > 0:
+            print(f"\n📄 Recent Documents:")
+            docs = self.db_session.query(Document).order_by(Document.upload_date.desc()).limit(3).all()
+            for doc in docs:
+                print(f"   • {doc.filename} ({doc.status}) - {doc.upload_date.strftime('%Y-%m-%d %H:%M')}")
 
 
 # ============================================================================
