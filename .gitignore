@@ -8,6 +8,9 @@ extracted_images/
 indexes/
 rag_local.db
 
+# PDF files
+*.pdf
+
 # Distribution / packaging
 .Python
 build/
