@@ -271,25 +271,72 @@ TEXT: [extracted text]"""
         messages: List[Dict[str, str]], 
         context: str = None
     ) -> str:
-        """Chat with context"""
+        """Chat with context - ULTRA-STRONG grounding to prevent hallucination"""
         
-        # Build system message with context
-        system_msg = "You are a helpful AI assistant."
+        # ULTRA-STRONG system message - Maximum grounding for small models
         if context:
-            system_msg += f"\n\nContext from documents:\n{context}\n\nUse this context to answer questions accurately."
+            system_msg = f"""You are a STRICT document reader. You can ONLY read and quote from the documents below.
+
+🚫 ABSOLUTE PROHIBITIONS:
+- DO NOT use ANY knowledge from your training
+- DO NOT make ANY assumptions
+- DO NOT infer ANYTHING beyond what's explicitly written
+- DO NOT add ANYTHING that's not in the documents
+
+✅ WHAT YOU MUST DO:
+1. Read ONLY the documents between === SOURCE X === markers
+2. Find the EXACT text that answers the question
+3. Quote or paraphrase ONLY that text
+4. Cite the SOURCE number (e.g., "Source 1 states...")
+5. If the answer is NOT in the documents, say: "This information is not in the provided documents."
+
+📄 DOCUMENTS TO READ:
+{context}
+
+⚠️ REMEMBER: You are a READER, not a WRITER. Only extract what's already there!"""
+        else:
+            system_msg = "You are a helpful assistant."
         
-        # Build prompt from messages
-        prompt = "\n".join([
-            f"{msg['role']}: {msg['content']}" 
-            for msg in messages
-        ])
+        # Build prompt from messages - only use latest question for RAG
+        if context:
+            # For RAG: only send current question to avoid confusion
+            prompt = messages[-1]['content']
+        else:
+            # For non-RAG: include full conversation
+            prompt = "\n".join([
+                f"{msg['role']}: {msg['content']}" 
+                for msg in messages
+            ])
         
-        return self.generate(
-            model=self.config.chat_model,
-            prompt=prompt,
-            system=system_msg,
-            timeout=self.config.ollama_timeout
-        )
+        # Use /api/chat for better control with stronger grounding parameters
+        url = f"{self.base_url}/api/chat"
+        
+        chat_messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt}
+        ]
+        
+        payload = {
+            "model": self.config.chat_model,
+            "messages": chat_messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.0,  # ZERO temperature for maximum factuality!
+                "top_p": 0.8,  # Reduced for more focused responses
+                "top_k": 20,  # Limit vocabulary to most likely tokens
+                "repeat_penalty": 1.2,  # Increased to prevent repetition
+                "num_ctx": 4096  # Ensure enough context window
+            }
+        }
+        
+        try:
+            response = requests.post(url, json=payload, timeout=self.config.ollama_timeout)
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except requests.exceptions.Timeout:
+            return f"Error: Request timed out after {self.config.ollama_timeout} seconds"
+        except Exception as e:
+            return f"Error: {str(e)}"
 
 
 # ============================================================================
@@ -1297,24 +1344,6 @@ class HybridRetriever:
                 'score': 0.0,
                 'rank': i + 1
             } for i, chunk in enumerate(chunks[:top_k])]
-                })
-            return final_results
-            
-        except Exception as e:
-            print(f"Error during reranking: {str(e)}")
-            # Fallback: return chunks with default scoring
-            return [{
-                'chunk_id': chunk['chunk_id'],
-                'text': chunk['text'],
-                'document_id': chunk['document_id'],
-                'heading_path': chunk.get('heading_path', ''),
-                'has_images': chunk.get('has_images', False),
-                'metadata': chunk['metadata'],
-                'score': 0.0,  # Default score
-                'rank': i + 1
-            } for i, chunk in enumerate(chunks[:top_k])]
-            })
-        return final_results
 
 
 # ============================================================================
@@ -1370,21 +1399,33 @@ class RAGChatbot:
         }
     
     def _build_context(self, chunks: List[Dict]) -> str:
-        """Build context from retrieved chunks"""
+        """Build context from retrieved chunks - IMPROVED with TRUNCATION to prevent hallucination"""
         context_parts = []
         
-        for i, chunk in enumerate(chunks, 1):
-            heading = f" ({chunk['heading_path']})" if chunk.get('heading_path') else ""
-            
-            # Add image info if present
-            image_info = ""
-            if chunk.get('has_images') and chunk.get('metadata', {}).get('image_paths'):
-                num_images = len(chunk['metadata']['image_paths'])
-                image_info = f" [Contains {num_images} image(s)]"
-            
-            context_parts.append(f"[Source {i}{heading}{image_info}]\n{chunk['text']}\n")
+        # CRITICAL FIX: Limit chunk size to prevent context overload
+        # Small models (3B params) can't handle massive chunks - they start hallucinating!
+        MAX_CHUNK_CHARS = 800  # ~200 tokens per chunk (conservative estimate)
         
-        return "\n".join(context_parts)
+        for i, chunk in enumerate(chunks, 1):
+            # TRUNCATE the chunk text to prevent overwhelming the model
+            chunk_text = chunk['text']
+            if len(chunk_text) > MAX_CHUNK_CHARS:
+                chunk_text = chunk_text[:MAX_CHUNK_CHARS] + "..."
+                print(f"⚠️  Truncated Source {i} from {len(chunk['text'])} to {MAX_CHUNK_CHARS} chars")
+            
+            # IMPROVED: More explicit source labeling with clear boundaries
+            # This helps small models understand where each source begins/ends
+            source_header = f"=== SOURCE {i} ==="
+            source_footer = f"=== END SOURCE {i} ==="
+            
+            # Include heading path if available for better context
+            heading = chunk.get('heading_path', '')
+            if heading:
+                context_parts.append(f"{source_header}\nSection: {heading}\n\n{chunk_text}\n{source_footer}")
+            else:
+                context_parts.append(f"{source_header}\n{chunk_text}\n{source_footer}")
+        
+        return "\n\n".join(context_parts)
     
     def _format_sources(self, chunks: List[Dict]) -> List[Dict]:
         """Format source citations"""
