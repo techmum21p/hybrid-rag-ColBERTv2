@@ -4,12 +4,12 @@ __pycache__/
 *$py.class
 
 # Extracted images and databases
-extracted_images/
-indexes/
-rag_local.db
+# extracted_images/
+# indexes/
+# rag_local.db
 
 # PDF files
-*.pdf
+# *.pdf
 
 # Distribution / packaging
 .Python
